@@ -20,7 +20,7 @@
 # MORE ABOUT THIS SCRIPT AVAILABLE IN THE README AND AT:
 #
 # http://zertrin.org/projects/duplicity-backup/ (for this version)
-# http://damontimm.com/code/dt-s3-backup (for the original programi by Damon Timm)
+# http://damontimm.com/code/dt-s3-backup (for the original program by Damon Timm)
 #
 # Latest code available at:
 # http://github.com/zertrin/duplicity-backup
@@ -29,9 +29,13 @@
 
 # Default config file (don't forget to copy duplicity-backup.conf.example to
 # match that path)
-# NOTE: It can be useful not to edit this script at all to ease future updates
-#       so the config file can be specified directly on the command line too
-#       with the -c option.
+#
+# NOTE: It is RECOMMENDED to use the command line option -c to specify the
+#       location of the config file. The CONFIG variable here is only used for
+#       fallback purposes (look for the file named 'duplicity-backup.conf' in
+#       the same folder as the script, if the option -c is not given).
+#       It is DEPRECATED to edit this.
+
 CONFIG="duplicity-backup.conf"
 
 ##############################################################
@@ -166,13 +170,22 @@ else
   usage
   exit 1
 fi
+
 STATIC_OPTIONS="$DRY_RUN$STATIC_OPTIONS"
 
 SIGN_PASSPHRASE=$PASSPHRASE
+
 export AWS_ACCESS_KEY_ID
 export AWS_SECRET_ACCESS_KEY
+export GS_ACCESS_KEY_ID
+export GS_SECRET_ACCESS_KEY
+export SWIFT_USERNAME
+export SWIFT_PASSWORD
+export SWIFT_AUTHURL
+export SWIFT_AUTHVERSION
 export PASSPHRASE
 export SIGN_PASSPHRASE
+
 if [[ -n "$FTP_PASSWORD" ]]; then
   export FTP_PASSWORD
 fi
@@ -212,16 +225,38 @@ elif [ "$ENCRYPTION" = "no" ]; then
   ENCRYPT="--no-encryption"
 fi
 
-NO_S3CMD="WARNING: s3cmd is not installed, remote file \
+NO_GSCMD="WARNING: gsutil not found in PATH, remote file \
+size information unavailable."
+NO_GSCMD_CFG="WARNING: gsutil is not configured, run 'gsutil config' \
+in order to retrieve remote file size information. Remote file \
+size information unavailable."
+
+NO_S3CMD="WARNING: s3cmd not found in PATH, remote file \
 size information unavailable."
 NO_S3CMD_CFG="WARNING: s3cmd is not configured, run 's3cmd --configure' \
 in order to retrieve remote file size information. Remote file \
 size information unavailable."
+
 README_TXT="In case you've long forgotten, this is a backup script that you used to backup some files (most likely remotely at Amazon S3). In order to restore these files, you first need to import your GPG private(s) key(s) (if you haven't already). The key(s) is/are in this directory and the following command(s) should do the trick:\n\nIf you were using the same key for encryption and signature:\n  gpg --allow-secret-key-import --import duplicity-backup-encryption-and-sign-secret.key.txt\nOr if you were using two separate keys for encryption and signature:\n  gpg --allow-secret-key-import --import duplicity-backup-encryption-secret.key.txt\n  gpg --allow-secret-key-import --import duplicity-backup-sign-secret.key.txt\n\nAfter your key(s) has/have been succesfully imported, you should be able to restore your files.\n\nGood luck!"
 
 if [ ! -x "$DUPLICITY" ]; then
   echo "ERROR: duplicity not installed, that's gotta happen first!" >&2
   exit 1
+fi
+
+if  [ "`echo ${DEST} | cut -c 1,2`" = "gs" ]; then
+  DEST_IS_GS=true
+  GSCMD="$(which gsutil)"
+  if [ ! -x "$GSCMD" ]; then
+    echo $NO_GSCMD; GSCMD_AVAIL=false
+  elif [ ! -f "${HOME}/.boto" ]; then
+    echo $NO_GSCMD_CFG; GSCMD_AVAIL=false
+  else
+    GSCMD_AVAIL=true
+    GSCMD="${GSCMD}"
+  fi
+else
+  DEST_IS_GS=false
 fi
 
 if  [ "`echo ${DEST} | cut -c 1,2`" = "s3" ]; then
@@ -230,15 +265,18 @@ if  [ "`echo ${DEST} | cut -c 1,2`" = "s3" ]; then
   if [ ! -x "$S3CMD" ]; then
     echo $NO_S3CMD; S3CMD_AVAIL=false
   elif [ -z "$S3CMD_CONF_FILE" -a ! -f "${HOME}/.s3cfg" ]; then
+    S3CMD_CONF_FOUND=false
     echo $NO_S3CMD_CFG; S3CMD_AVAIL=false
   elif [ ! -z "$S3CMD_CONF_FILE" -a ! -f "$S3CMD_CONF_FILE" ]; then
+    S3CMD_CONF_FOUND=false
     echo "${S3CMD_CONF_FILE} not found, check S3CMD_CONF_FILE variable in duplicity-backup's configuration!";
     echo $NO_S3CMD_CFG;
     S3CMD_AVAIL=false
   else
     S3CMD_AVAIL=true
-
+    S3CMD_CONF_FOUND=true
     if [ ! -z "$S3CMD_CONF_FILE" -a -f "$S3CMD_CONF_FILE" ]; then
+      # if conf file specified and it exists then add it to the command line for s3cmd
       S3CMD="${S3CMD} -c ${S3CMD_CONF_FILE}"
     fi
   fi
@@ -258,8 +296,8 @@ check_variables ()
 {
   [[ ${ROOT} = "" ]] && config_sanity_fail "ROOT must be configured"
   [[ ${DEST} = "" || ${DEST} = "s3+http://backup-foobar-bucket/backup-folder/" ]] && config_sanity_fail "DEST must be configured"
-  [[ ${INCLIST} = "/home/foobar_user_name/Documents/" ]] && config_sanity_fail "INCLIST must be configured" 
-  [[ ${EXCLIST} = "/home/foobar_user_name/Documents/foobar-to-exclude" ]] && config_sanity_fail "EXCLIST must be configured" 
+  [[ ${INCLIST} = "/home/foobar_user_name/Documents/" ]] && config_sanity_fail "INCLIST must be configured"
+  [[ ${EXCLIST} = "/home/foobar_user_name/Documents/foobar-to-exclude" ]] && config_sanity_fail "EXCLIST must be configured"
   [[ ( ${ENCRYPTION} = "yes" && (${GPG_ENC_KEY} = "foobar_gpg_key" || \
        ${GPG_SIGN_KEY} = "foobar_gpg_key" || \
        ${PASSPHRASE} = "foobar_gpg_passphrase")) ]] && \
@@ -267,6 +305,8 @@ check_variables ()
   [[ ${LOGDIR} = "/home/foobar_user_name/logs/test2/" ]] && config_sanity_fail "LOGDIR must be configured"
   [[ ( ${DEST_IS_S3} = true && (${AWS_ACCESS_KEY_ID} = "foobar_aws_key_id" || ${AWS_SECRET_ACCESS_KEY} = "foobar_aws_access_key" )) ]] && \
   config_sanity_fail "An s3 DEST has been specified, but AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY have not been configured"
+  [[ ( ${DEST_IS_GS} = true && (${GS_ACCESS_KEY_ID} = "foobar_gcs_key_id" || ${GS_SECRET_ACCESS_KEY} = "foobar_gcs_secret_id" )) ]] && \
+  config_sanity_fail "A Google Cloud Storage DEST has been specified, but GS_ACCESS_KEY_ID or GS_SECRET_ACCESS_KEY have not been configured"
   [[ ! -z "$INCEXCFILE" && ! -f $INCEXCFILE ]] && config_sanity_fail "The specified INCEXCFILE $INCEXCFILE does not exists"
 }
 
@@ -385,7 +425,7 @@ get_source_file_size()
       awk '{ FS="\t"; $0=$0; print $1"\t"$2 }' \
       >> ${LOGFILE}
   done
-  
+
   echo >> ${LOGFILE}
 
   # Restore IFS
@@ -395,14 +435,33 @@ get_source_file_size()
 get_remote_file_size()
 {
   echo "---------[ Destination Disk Use Information ]--------" >> ${LOGFILE}
-
+  FRIENDLY_TYPE_NAME=""
   dest_type=`echo ${DEST} | cut -c 1,2`
   case $dest_type in
+    "ss")
+      FRIENDLY_TYPE_NAME="SSH"
+
+      TMPDEST="${DEST#*://*/}"
+      TMPDEST="${DEST%/${TMPDEST}}"
+      ssh_opt=`echo $STATIC_OPTIONS |awk -vo="--ssh-options=" '{s=index($0,o); if (s) {s=substr($0,s+length(o)); m=substr(s,0,1); for (i=2; i < length(s); i++) { if (substr(s,i,1) == m && substr(s,i-1,1) != "\\\\") break; } print substr(s,2,i-2)}}'`
+
+      SIZE=`${TMPDEST%://*} ${ssh_opt} ${TMPDEST#*//} du -hs ${DEST#${TMPDEST}/} | awk '{print $1}'` 2>> ${LOGFILE}
+      EMAIL_SUBJECT="$EMAIL_SUBJECT $SIZE `${TMPDEST%://*} ${ssh_opt} ${TMPDEST#*//} df -hP ${DEST#${TMPDEST}/} | awk '{tmp=$5 " used"}END{print tmp}'`" 2>> ${LOGFILE}
+    ;;
     "fi")
+      FRIENDLY_TYPE_NAME="File"
       TMPDEST=`echo ${DEST} | cut -c 6-`
       SIZE=`du -hs ${TMPDEST} | awk '{print $1}'`
     ;;
+    "gs")
+      FRIENDLY_TYPE_NAME="Google Cloud Storage"
+      if $GSCMD_AVAIL ; then
+        TMPDEST=`echo $DEST | sed -e "s/\/*$//" `
+        SIZE=`gsutil du -hs ${TMPDEST} | awk '{print $1$2}'`
+      fi
+    ;;
     "s3")
+      FRIENDLY_TYPE_NAME="Amazon S3"
       if $S3CMD_AVAIL ; then
           TMPDEST=$(echo ${DEST} | cut -c 11-)
           dest_scheme=$(echo ${DEST} | cut -f -1 -d :)
@@ -412,15 +471,25 @@ get_remote_file_size()
           fi
           SIZE=`${S3CMD} du -H s3://${TMPDEST} | awk '{print $1}'`
       else
-          SIZE="s3cmd not installed."
+          if ! $S3CMD_CONF_FOUND ; then
+              SIZE="-s3cmd config not found-"
+          else
+              SIZE="-s3cmd not found in PATH-"
+          fi
       fi
     ;;
     *)
-      SIZE="unsupported by backend"
+      # not yet available for the other backends
+      FRIENDLY_TYPE_NAME=""
     ;;
   esac
 
-  echo "Current Remote Backup Disk Usage: ${SIZE}" >> ${LOGFILE}
+  if [[ $FRIENDLY_TYPE_NAME ]] ; then
+      echo -e ""$SIZE"\t"$FRIENDLY_TYPE_NAME" type backend" >> ${LOGFILE}
+  else
+      echo "Destination disk use information is currently only available for the following storage backends:" >> ${LOGFILE}
+      echo "File, SSH, Amazon S3 and Google Cloud" >> ${LOGFILE}
+  fi
   echo >> ${LOGFILE}
 }
 
@@ -434,9 +503,9 @@ include_exclude()
   # Exlcude device files?
   if [ ! -z $EXDEVICEFILES ] && [ $EXDEVICEFILES -ne 0 ]; then
     TMP=" --exclude-device-files"
-    INCLUDE=$INCLUDE$TMP
+    EXCLUDE=$EXCLUDE$TMP
   fi
-  
+
   for include in ${INCLIST[@]}
   do
     TMP=" --include=""'"$include"'"
@@ -448,21 +517,21 @@ include_exclude()
     TMP=" --exclude ""'"$exclude"'"
     EXCLUDE=$EXCLUDE$TMP
   done
-  
+
   # Include/Exclude globbing filelist
   if [ "$INCEXCFILE" != '' ]; then
     TMP=" --include-globbing-filelist ""'"$INCEXCFILE"'"
     INCLUDE=$INCLUDE$TMP
   fi
-  
+
   # INCLIST and globbing filelist is empty so every file needs to be saved
   if [ "$INCLIST" == '' ] && [ "$INCEXCFILE" == '' ]; then
     EXCLUDEROOT=''
   else
     EXCLUDEROOT="--exclude=**"
   fi
-  
-  
+
+
   # Restore IFS
   IFS=$OLDIFS
 }
@@ -471,29 +540,41 @@ duplicity_cleanup()
 {
   echo "----------------[ Duplicity Cleanup ]----------------" >> ${LOGFILE}
   if [[ "${CLEAN_UP_TYPE}" != "none" && ! -z ${CLEAN_UP_TYPE} && ! -z ${CLEAN_UP_VARIABLE} ]]; then
-    eval ${ECHO} ${DUPLICITY} ${CLEAN_UP_TYPE} ${CLEAN_UP_VARIABLE} ${STATIC_OPTIONS} --force \
-      ${ENCRYPT} \
-      ${DEST} >> ${LOGFILE}
+    {
+      eval ${ECHO} ${DUPLICITY} ${CLEAN_UP_TYPE} ${CLEAN_UP_VARIABLE} ${STATIC_OPTIONS} --force \
+        ${ENCRYPT} \
+        ${DEST} >> ${LOGFILE}
+    } || {
+      BACKUP_ERROR=1
+    }
     echo >> ${LOGFILE}
   fi
   if [ ! -z ${REMOVE_INCREMENTALS_OLDER_THAN} ] && [[ ${REMOVE_INCREMENTALS_OLDER_THAN} =~ ^[0-9]+$ ]]; then
-    eval ${ECHO} ${DUPLICITY} remove-all-inc-of-but-n-full ${REMOVE_INCREMENTALS_OLDER_THAN} \
-      ${STATIC_OPTIONS} --force \
-      ${ENCRYPT} \
-      ${DEST} >> ${LOGFILE}
+    {
+      eval ${ECHO} ${DUPLICITY} remove-all-inc-of-but-n-full ${REMOVE_INCREMENTALS_OLDER_THAN} \
+        ${STATIC_OPTIONS} --force \
+        ${ENCRYPT} \
+        ${DEST} >> ${LOGFILE}
+    } || {
+      BACKUP_ERROR=1
+    }
     echo >> ${LOGFILE}
-  fi  
+  fi
 }
 
 duplicity_backup()
 {
-  eval ${ECHO} ${DUPLICITY} ${OPTION} ${VERBOSITY} ${STATIC_OPTIONS} \
-  ${ENCRYPT} \
-  ${EXCLUDE} \
-  ${INCLUDE} \
-  ${EXCLUDEROOT} \
-  ${ROOT} ${DEST} \
-  >> ${LOGFILE}
+  {
+    eval ${ECHO} ${DUPLICITY} ${OPTION} ${VERBOSITY} ${STATIC_OPTIONS} \
+    ${ENCRYPT} \
+    ${EXCLUDE} \
+    ${INCLUDE} \
+    ${EXCLUDEROOT} \
+    ${ROOT} ${DEST} \
+    >> ${LOGFILE}
+  } || {
+    BACKUP_ERROR=1
+  }
 }
 
 setup_passphrase()
@@ -600,18 +681,18 @@ backup_this_script()
 
   echo -e ${README_TXT} > ${README}
   echo "Encrypting tarball, choose a password you'll remember..."
-  tar c ${TMPDIR} | gpg -aco ${TMPFILENAME}
+  tar -cf - ${TMPDIR} | gpg -aco ${TMPFILENAME}
   rm -Rf ${TMPDIR}
   echo -e "\nIMPORTANT!!"
   echo ">> To restore these files, run the following (remember your password):"
-  echo "gpg -d ${TMPFILENAME} | tar x"
+  echo "gpg -d ${TMPFILENAME} | tar -xf -"
   echo -e "\nYou may want to write the above down and save it with the file."
 }
 
 check_variables
 check_logdir
 
-echo -e "--------    START DUPLICITY-BACKUP SCRIPT    --------\n" >> ${LOGFILE}
+echo -e "--------    START DUPLICITY-BACKUP SCRIPT for ${HOSTNAME}   --------\n" >> ${LOGFILE}
 
 get_lock
 
@@ -763,7 +844,19 @@ esac
 
 echo -e "---------    END DUPLICITY-BACKUP SCRIPT    ---------\n" >> ${LOGFILE}
 
-email_logfile
+if [ "$EMAIL_FAILURE_ONLY" = "yes" ]; then
+  if [ ${BACKUP_ERROR} ]; then
+    EMAIL_SUBJECT="BACKUP ERROR: ${EMAIL_SUBJECT}"
+    email_logfile
+  fi
+else
+  if [ ${BACKUP_ERROR} ]; then
+    EMAIL_SUBJECT="BACKUP ERROR: ${EMAIL_SUBJECT}"
+  else
+    EMAIL_SUBJECT="BACKUP OK: ${EMAIL_SUBJECT}"
+  fi
+  email_logfile
+fi
 
 # remove old logfiles
 # stops them from piling up infinitely
@@ -775,7 +868,10 @@ fi
 
 unset AWS_ACCESS_KEY_ID
 unset AWS_SECRET_ACCESS_KEY
+unset GS_ACCESS_KEY_ID
+unset GS_SECRET_ACCESS_KEY
 unset PASSPHRASE
 unset SIGN_PASSPHRASE
+unset FTP_PASSWORD
 
 # vim: set tabstop=2 shiftwidth=2 sts=2 autoindent smartindent:
